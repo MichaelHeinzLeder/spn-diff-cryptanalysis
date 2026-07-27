@@ -36,4 +36,4 @@ The `execute_complete_break` automatically extracts the full master key via a hi
 - *Phase 2: some algebra* 
 → deterministic break by linear relationship
 ---
-**Note: EVERYTHING is explained in full detail within the accompanying notebook!**
+**Note: EVERYTHING is explained in full detail within the accompanying notebook cryptanalysis.ipynb!**
