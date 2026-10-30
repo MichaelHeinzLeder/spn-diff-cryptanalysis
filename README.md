@@ -11,7 +11,7 @@ Python and SageMath implementation and differential cryptanalysis of a 4-round, 
 - **Chosen-Plaintext Oracle (`modules/oracle.py`)**: Black-box CPA encryption oracle (`EncryptionOracle`) backed by a CSPRNG-generated 80-bit master key (`secrets.randbits(80)`) and subkey verification without key disclosure.
 - **Differential Cryptanalysis Engine (`modules/diff_cryptanalysis.py`)**:
   - **Phase 1 (Statistical Partial Decryption — $K_5 \to K_4 \to K_3$)**: Constructs the $16 \times 16$ Difference Distribution Table (DDT), ranks $(R-1)$-round differential trails under the Markov cipher assumption, selects minimal S-box covers, and intersects partial subkey masks across chosen-plaintext pairs ($N_D \approx c / P_D$).
-  - **Phase 2 (Algebraic Layer Elimination — $K_2 \text{ \& } K_1$)**: Exploits the linear key-mixing identity $\Delta U_2 = (W_{1,1} \oplus K_2) \oplus (W_{1,2} \oplus K_2) = \Delta W_1$ to eliminate $K_2$, isolates $K_1$ nibble-wise across 4 plaintext pairs via $\pi_P^{-1}(\Delta W_1) = \Delta V_1$, and recovers $K_2 = U_2 \oplus W_1$ deterministically.
+  - **Phase 2 (Algebraic Layer Elimination — $K_2$ & $K_1$)**: Exploits the linear key-mixing identity $\Delta U_2 = (W_{1,1} \oplus K_2) \oplus (W_{1,2} \oplus K_2) = \Delta W_1$ to eliminate $K_2$, isolates $K_1$ nibble-wise across 4 plaintext pairs via $\pi_P^{-1}(\Delta W_1) = \Delta V_1$, and recovers $K_2 = U_2 \oplus W_1$ deterministically.
 
 ```text
 .
