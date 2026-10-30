@@ -1,44 +1,58 @@
-from modules.bits import Bits
-from modules import spn
-from datetime import datetime
-import random
+"""Two-phase differential cryptanalysis engine for R-round Substitution-Permutation Networks."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
 import itertools
+import random
+from typing import TypeAlias
+
+from modules import spn
+from modules.bits import Bits
+
+# (preference_score, propagation_probability, input_diff_16bit, output_diff_16bit)
+Trail: TypeAlias = tuple[float, float, int, int]
+OracleFn: TypeAlias = Callable[[int], int]
 
 
 class DifferentialAttack:
-    """
-    Executes a complete differential cryptanalysis attack on a R-round Substitution-Permutation Network (SPN).
+    """Executes a complete chosen-plaintext differential attack on a 4-round 16-bit SPN.
+
+    The attack proceeds in two phases:
+        1. Iterative statistical partial decryption (K5 -> K4 -> K3) using minimal covers of
+           high-probability (R-1)-round differential trails and bitwise candidate intersection.
+        2. Algebraic elimination of K2 via the linear identity ΔU_2 = ΔW_1, followed by
+           per-nibble S-box differential filtering to deterministically recover K1 and K2.
     """
 
-    def __init__(self, expected_right_pairs: int = 4, num_rounds=4):
-        """
-        Initializes the differential attack state and computes lookup tables with a default count of 4 expected right pairs.
+    def __init__(self, expected_right_pairs: int = 4, num_rounds: int = 4) -> None:
+        """Initializes the attack engine and precomputes S-box, DDT, and P-box lookup tables.
 
         Args:
-            expected_right_pairs (int): adjustabel constant 'c' for the expected right pairs - meant as a measure for statistical noise.
-            Determines roughly expected value N, where N ≈ c / p
-            'N':= num of plaintext pairs.
-            'c':= see above
-            'p':= trail probability for the R-1 round differential characteristic.
-            num_rounds (int): number of rounds in SPN
+            expected_right_pairs: Target number of right pairs `c` used to size the chosen-plaintext
+                sample `N_D = int(c / P_D)` for statistical signal-to-noise separation.
+            num_rounds: Total number of SPN rounds `R` (default: 4).
         """
-        self.expected_right_pairs = expected_right_pairs
-        self.num_rounds = num_rounds
-        self.sbox_list = self._convert_sbox_to_arr(spn.heys_s_map)
-        self.inverse_sbox_list = self._invert_sbox(self.sbox_list)
-        self.ddt = self._build_ddt()
+        if expected_right_pairs <= 0:
+            raise ValueError("expected_right_pairs must be positive")
+        if num_rounds < 2:
+            raise ValueError("num_rounds must be at least 2")
+
+        self.expected_right_pairs: int = expected_right_pairs
+        self.num_rounds: int = num_rounds
+        self.sbox_list: list[int] = self._convert_sbox_to_arr(spn.heys_s_map)
+        self.inverse_sbox_list: list[int] = self._invert_sbox(self.sbox_list)
+        self.ddt: list[list[int]] = self._build_ddt()
+
+        # Precompute best differential output and probability per 4-bit S-box input difference
+        self._best_sbox_diff: list[tuple[int, float]] = [
+            (self.ddt[dx].index(max(self.ddt[dx])), max(self.ddt[dx]) / 16.0)
+            for dx in range(16)
+        ]
 
     @staticmethod
     def _convert_sbox_to_arr(sbox_map: dict[str, str]) -> list[int]:
-        """
-        Converts the string-based S-box mapping into a onedimensional int-array.
-
-        Args:
-            sbox_map (dict[str, str]): Dictionary mapping 4-bit binary strings to 4-bit binary strings.
-
-        Returns:
-            list[int]: 16-element list representing the S-box substitution.
-        """
+        """Converts a 4-bit binary-string S-box dictionary into a 16-element integer LUT."""
         sbox = [0] * 16
         for in_bits, out_bits in sbox_map.items():
             sbox[int(in_bits, 2)] = int(out_bits, 2)
@@ -46,107 +60,99 @@ class DifferentialAttack:
 
     @staticmethod
     def _invert_sbox(sbox_list: list[int]) -> list[int]:
-        """
-        Computes the inverse S-box mapping for partial decryption.
-
-        Args:
-            sbox_list (list[int]): 16-element list representing the S-box.
-
-        Returns:
-            list[int]: 16-element list representing the inverse S-box.
-        """
+        """Computes the inverse 16-element S-box lookup table."""
         inverse_sbox = [0] * 16
         for idx, val in enumerate(sbox_list):
             inverse_sbox[val] = idx
         return inverse_sbox
 
     def _build_ddt(self) -> list[list[int]]:
-        """
-        Constructs the 16x16 Difference Distribution Table (DDT).
+        """Constructs the 16x16 Difference Distribution Table (DDT) for the 4-bit S-box.
 
         Returns:
-            list[list[int]]: 16x16 matrix where DDT[input_diff][output_diff] = propagation frequency.
+            16x16 matrix where `ddt[dx][dy]` counts inputs `x` satisfying
+            `S(x) ^ S(x ^ dx) == dy`.
         """
         ddt = [[0] * 16 for _ in range(16)]
-        for input_diff in range(16):
+        for dx in range(16):
             for x_val in range(16):
-                dx = input_diff
-                y_val = self.sbox_list[x_val]
-                y_xor_dy = self.sbox_list[x_val ^ dx]
-                ddt[dx][y_val ^ y_xor_dy] += 1
+                dy = self.sbox_list[x_val] ^ self.sbox_list[x_val ^ dx]
+                ddt[dx][dy] += 1
         return ddt
 
     def _evaluate_trail(self, start_diff: int, round_num: int) -> tuple[int, float, float]:
-        """
-        Greedily evaluates the probability of a differential characteristic (trail).
+        """Greedily propagates a 16-bit input difference ΔX across `round_num` SPN rounds.
 
         Args:
-            start_diff (int): The 16-bit initial input difference (ΔX).
-            round_num (int): The number of rounds to evaluate.
+            start_diff: Initial 16-bit input difference ΔX in [1, 0xFFFF].
+            round_num: Number of SPN rounds to propagate through.
 
         Returns:
-            tuple[int, float, float]: Tuple containing:
-                - final_xor (int): Expected output difference.
-                - probability (float): Overall probability of the characteristic.
-                - preference (float): Weighted probability penalizing 3 or 4 active S-boxes.
+            Tuple `(output_diff, probability, preference)` where `preference` penalizes
+            characteristics that activate 3 or 4 S-boxes in the target round.
         """
         probability = 1.0
-        current_bits = Bits(f"{start_diff:016b}")
+        state = start_diff
 
         for _ in range(round_num):
+            substituted = 0
             for idx in range(4):
-                nibble = current_bits.get_nibble(idx)
+                shift = idx << 2
+                nibble = (state >> shift) & 0xF
                 if nibble > 0:
-                    max_count = max(self.ddt[nibble])
-                    best_out_diff = self.ddt[nibble].index(max_count)
-                    probability *= max_count / 16.0
-                    current_bits = current_bits.set_nibble(idx, best_out_diff)
+                    best_out_diff, sbox_prob = self._best_sbox_diff[nibble]
+                    probability *= sbox_prob
+                    substituted |= best_out_diff << shift
+            state = spn.permute_16bit_int(substituted)
 
-            current_bits = spn.p_box(current_bits, spn.heys_p_matrix)
+        out_diff = state
+        active_sboxes = sum(1 for i in range(4) if ((out_diff >> (i << 2)) & 0xF) > 0)
+        if active_sboxes >= 4:
+            preference = 0.0
+        elif active_sboxes == 3:
+            preference = probability / 4.0
+        else:
+            preference = probability
 
-        active_sboxes = sum(1 for i in range(4) if current_bits.get_nibble(i) > 0)
-        preference = probability / (4 if active_sboxes == 3 else 1) if active_sboxes < 4 else 0.0
-        return current_bits.to_int(), probability, preference
+        return out_diff, probability, preference
 
-    def get_highly_probable_trails(self, round_num: int) -> list[tuple[float, float, int, int]]:
-        """
-        Computes all highly probable differential characteristics for a specific round length.
+    def get_highly_probable_trails(self, round_num: int) -> list[Trail]:
+        """Enumerates all non-zero 16-bit input differences and ranks valid differential trails.
 
         Args:
-            round_num (int): Number of active rounds for the characteristic.
+            round_num: Number of rounds for the differential characteristic.
 
         Returns:
-            list[tuple[float, float, int, int]]: Sorted list containing (preference, probability, input_diff, output_diff).
+            Descending-sorted list of `(preference, probability, input_diff, output_diff)` tuples.
         """
-        trails = []
-        for input_diff in range(1, 0x10000):  # intervall: [1, 0xFFFF]
+        trails: list[Trail] = []
+        for input_diff in range(1, 0x10000):
             out_diff, prob, pref = self._evaluate_trail(input_diff, round_num)
             if pref > 0.0:
                 trails.append((pref, prob, input_diff, out_diff))
         return sorted(trails, reverse=True)
 
     @staticmethod
-    def find_trail_combinations(trails: list[tuple]) -> list[tuple]:
-        """
-        Selects a minimal combination of trails that collectively activate all 4 S-boxes.
+    def find_trail_combinations(trails: list[Trail]) -> list[Trail]:
+        """Selects a greedy minimal subset of trails covering all four 4-bit S-box positions.
 
         Args:
-            trails (list[tuple]): List of available differential trails.
+            trails: Ranked differential trails from `get_highly_probable_trails`.
 
         Returns:
-            list[tuple]: Subset of trails needed to break all subkey bits of a round.
+            Subset of trails whose output differences jointly activate all 4 S-boxes.
         """
-        useful_trails = []
+        useful_trails: list[Trail] = []
         sbox_covered = [False] * 4
 
         for trail in trails:
             _, _, _, out_diff = trail
-            useful = False
+            newly_covered = False
             for i in range(4):
                 if ((out_diff >> (12 - i * 4)) & 0xF) > 0 and not sbox_covered[i]:
                     sbox_covered[i] = True
-                    useful = True
-            if useful:
+                    newly_covered = True
+            if newly_covered:
                 useful_trails.append(trail)
             if all(sbox_covered):
                 break
@@ -154,294 +160,295 @@ class DifferentialAttack:
 
     @staticmethod
     def get_active_key_mask(output_diff: int, round_idx: int) -> int:
-        """
-        Determines the 16-bit mask targeting the active subkey bits based on the expected output difference.
+        """Computes the 16-bit mask isolating subkey bits connected to active S-boxes.
 
         Args:
-            output_diff (int): Expected output difference of the trail.
-            round_idx (int): Current target round (0-indexed).
+            output_diff: Expected 16-bit output difference ΔY before the target round.
+            round_idx: 0-indexed round being attacked (3 for K5, 2 for K4, 1 for K3).
 
         Returns:
-            int: 16-bit mask with 1s at positions of active subkey bits.
+            16-bit integer mask with 1s at active subkey bit positions.
         """
         mask = 0
         for i in range(4):
             if ((output_diff >> (12 - i * 4)) & 0xF) > 0:
-                mask |= (0xF << (12 - i * 4))
+                mask |= 0xF << (12 - i * 4)
 
         if round_idx < 3:
             mask = spn.p_box(Bits(f"{mask:016b}"), spn.heys_p_matrix).to_int()
         return mask
 
-    def _peel_cipher(self, ciphertext: int, round_keys: list[int], target_round: int) -> int:
-        """
-        Partially decrypts the ciphertext up to the specified target round.
+    def _peel_cipher(
+        self, ciphertext: int, round_keys: list[int], target_round: int
+    ) -> int:
+        """Partially decrypts a 16-bit ciphertext backward from round 4 down to `target_round`.
 
         Args:
-            ciphertext (int): 16-bit block to decrypt.
-            round_keys (list[int]): Array of known subkeys.
-            target_round (int): Round index to peel back to.
+            ciphertext: 16-bit ciphertext block.
+            round_keys: 5-element list of round subkeys `[K1, K2, K3, K4, K5]`.
+            target_round: Round index to stop at (returns internal state `U_{target_round+1}`).
 
         Returns:
-            int: Partially decrypted 16-bit state.
+            16-bit partially decrypted state before the target round's S-box layer.
         """
         state = ciphertext
         for r in range(4, target_round, -1):
             state ^= round_keys[r]
             if r < 4:
-                state = spn.inverse_p_box(Bits(f"{state:016b}"), spn.heys_p_matrix).to_int()
+                state = spn.permute_16bit_int(state)
 
-            new_state = 0
-            for i in range(4):
-                nibble = (state >> (12 - i * 4)) & 0xF
-                new_state |= (self.inverse_sbox_list[nibble] << (12 - i * 4))
-            state = new_state
+            state = (
+                (self.inverse_sbox_list[(state >> 12) & 0xF] << 12)
+                | (self.inverse_sbox_list[(state >> 8) & 0xF] << 8)
+                | (self.inverse_sbox_list[(state >> 4) & 0xF] << 4)
+                | self.inverse_sbox_list[state & 0xF]
+            )
         return state
 
-    def extract_partial_subkey(self, oracle: callable, trail: tuple, mask: int, target_round: int,
-                               known_keys=None, return_hits: bool = False) -> list[int]:
-        """
-        Extracts highly probable candidates for specific subkey bits using a single differential trail.
+    def extract_partial_subkey(
+        self,
+        oracle: OracleFn,
+        trail: Trail,
+        mask: int,
+        target_round: int,
+        known_keys: list[int] | None = None,
+        return_hits: bool = False,  # noqa: ARG002 - retained for notebook signature compatibility
+    ) -> list[tuple[int, int]]:
+        """Ranks partial subkey hypotheses for `mask` using a single differential trail.
 
         Args:
-            oracle (callable): Function returning 16-bit ciphertext for 16-bit plaintext.
-            trail (tuple): The applied differential characteristic.
-            mask (int): Active subkey bit mask.
-            target_round (int): Index of the round being attacked.
-            known_keys (list[int]): Current state of successfully extracted subkeys.
+            oracle: Chosen-plaintext encryption callable `encrypt(p: int) -> int`.
+            trail: Tuple `(preference, probability, in_diff, out_diff)`.
+            mask: 16-bit bitmask of active subkey bits.
+            target_round: Round index being attacked.
+            known_keys: Previously recovered subkeys `[K1..K5]`.
+            return_hits: Reserved parameter for API compatibility.
 
         Returns:
-            list[int]: Top 3 most probable values for the targeted partial subkey.
+            List of `(partial_key_guess, hit_count)` sorted in descending order of hits.
         """
-        if known_keys is None:
-            known_keys = [0] * 5
+        working_keys = [0] * 5 if known_keys is None else list(known_keys)
         _, probability, in_diff, out_diff = trail
         num_pairs = int(self.expected_right_pairs / probability)
 
-        hits = {}
-        pairs = []
+        pairs: list[tuple[int, int]] = []
         for _ in range(num_pairs):
             p1 = random.randint(0, 0xFFFF)
-            c1 = oracle(p1)
-            c2 = oracle(p1 ^ in_diff)
-            pairs.append((c1, c2))
+            pairs.append((oracle(p1), oracle(p1 ^ in_diff)))
 
-        active_shifts = [i for i in range(16) if (mask >> i) & 1]
-        for k_guess_bits in itertools.product([0, 1], repeat=len(active_shifts)):
+        active_shifts = [bit_idx for bit_idx in range(16) if (mask >> bit_idx) & 1]
+        hits: dict[int, int] = {}
+
+        for k_guess_bits in itertools.product((0, 1), repeat=len(active_shifts)):
             k_guess = 0
             for bit_val, shift in zip(k_guess_bits, active_shifts):
-                k_guess |= (bit_val << shift)
+                k_guess |= bit_val << shift
 
-            known_keys[target_round + 1] = k_guess
+            working_keys[target_round + 1] = k_guess
             hit_count = 0
             for c1, c2 in pairs:
-                v1 = self._peel_cipher(c1, known_keys, target_round)
-                v2 = self._peel_cipher(c2, known_keys, target_round)
+                v1 = self._peel_cipher(c1, working_keys, target_round)
+                v2 = self._peel_cipher(c2, working_keys, target_round)
                 if (v1 ^ v2) == out_diff:
                     hit_count += 1
 
             if hit_count > 0:
                 hits[k_guess] = hit_count
 
-        sorted_candidates = sorted(hits.items(), key=lambda x: x[1], reverse=True)
-        return sorted_candidates
+        return sorted(hits.items(), key=lambda item: item[1], reverse=True)
 
-    def _break_first_round_key(self, oracle: callable, known_keys: list[int]) -> int:
-        """
-        Deterministically extracts K1 by fully decrypting a single ciphertext and XORing with its plaintext.
-
-        Args:
-            oracle (callable): Function returning 16-bit ciphertext for 16-bit plaintext.
-            known_keys (list[int]): Array containing the already broken subkeys (K2-K5).
-
-        Returns:
-            int: The 16-bit first round subkey (K1).
-        """
+    def _break_first_round_key(self, oracle: OracleFn, known_keys: list[int]) -> int:
+        """Recovers K1 directly by peeling a single known plaintext-ciphertext pair to round 0."""
         plaintext = random.randint(0, 0xFFFF)
         ciphertext = oracle(plaintext)
         decrypted_state = self._peel_cipher(ciphertext, known_keys, 0)
         return plaintext ^ decrypted_state
 
     @staticmethod
-    def merge_key_candidates(partial_candidates: list[tuple[int, list[int]]]) -> list[int]:
-        """
-        merges partial subkey hypotheses using bitwise intersection to resolve ambiguities.
+    def merge_key_candidates(
+        partial_candidates: list[tuple[int, list[int]]],
+    ) -> list[int]:
+        """Combines partial subkey candidates across overlapping masks via bitwise consistency.
 
         Args:
-            partial_candidates (list[tuple[int, list[int]]]): list containing tuples of (active_mask, candidate_list).
+            partial_candidates: Sequence of `(active_mask, ordered_candidate_list)` pairs.
 
         Returns:
-            list[int]: mathematically valid full subkey candidates that satisfy all partial masks.
+            Ordered list of 16-bit subkeys consistent with all partial masks.
 
         Raises:
-            ValueError: if no valid intersection exists.
+            ValueError: If no mutually consistent 16-bit subkey combination exists.
         """
-        full_key_hypotheses = []
+        full_key_hypotheses: list[int] = []
 
-        # iteriere durch das kartesische produkt aller partiellen kandidaten
-        for combo in itertools.product(*[c for _, c in partial_candidates]):
+        for combo in itertools.product(*(cands for _, cands in partial_candidates)):
             merged_key = 0
+            covered_mask = 0
             valid = True
 
-            # validiere schnittmengen auf inkonsistenzen
             for (mask_i, _), cand_i in zip(partial_candidates, combo):
-                overlap = merged_key & mask_i
-                if overlap > 0 and (merged_key & overlap) != (cand_i & overlap):
+                overlap = covered_mask & mask_i
+                if overlap and (merged_key & overlap) != (cand_i & overlap):
                     valid = False
                     break
                 merged_key |= cand_i
+                covered_mask |= mask_i
 
             if valid:
                 full_key_hypotheses.append(merged_key)
 
         if not full_key_hypotheses:
-            raise ValueError("kein valider kandidat fuer subkey aus den schnittmengen gefunden.")
+            raise ValueError(
+                "No consistent 16-bit subkey candidate found from partial mask intersections."
+            )
 
         return full_key_hypotheses
 
-    def recover_remaining_layers(self, oracle: callable, known_keys: list[int]) -> tuple[int, int]:
-        """
-        executes phase 2 of the complete break: algebraically recovers k2 and k1 
-        by exploiting the linear relationship delta_u2 = delta_w1.
-        """
+    def recover_remaining_layers(
+        self, oracle: OracleFn, known_keys: list[int]
+    ) -> tuple[int, int]:
+        """Executes Phase 2: algebraically eliminates K2 via ΔU_2 = ΔW_1 to recover (K1, K2).
 
-        # k1-kandidaten pro nibble tracken. wir nutzen schnittmengen aus mehreren
-        # paaren, um "ghost-hits" der s-box auszufiltern.
-        k1_candidates = [set(range(16)) for _ in range(4)]
+        Because `U_2 = W_1 ^ K_2`, any pair of states `(U_{2,1}, U_{2,2})` peeled through
+        known subkeys `(K_5, K_4, K_3)` satisfies `U_{2,1} ^ U_{2,2} = W_{1,1} ^ W_{1,2}`.
+        Inverting the first-round P-box yields `ΔV_1`, isolating each 4-bit nibble of `K_1`
+        independently across 4 chosen plaintext pairs.
 
-        pairs = []
-        # 4 paare sind statistisch mehr als genug, um k1 absolut eindeutig zu machen
+        Args:
+            oracle: Chosen-plaintext encryption callable.
+            known_keys: Subkey array containing recovered `[_, _, K3, K4, K5]`.
+
+        Returns:
+            Tuple `(K1, K2)` of 16-bit integers.
+
+        Raises:
+            ValueError: If nibble candidate intersection yields an empty set.
+        """
+        k1_candidates: list[set[int]] = [set(range(16)) for _ in range(4)]
+        pairs: list[tuple[int, int, int, int]] = []
+
         for _ in range(4):
             p1 = random.randint(0, 0xFFFF)
             p2 = random.randint(0, 0xFFFF)
-            c1, c2 = oracle(p1), oracle(p2)
-            pairs.append((p1, p2, c1, c2))
+            pairs.append((p1, p2, oracle(p1), oracle(p2)))
 
         for p1, p2, c1, c2 in pairs:
-            # 1. target_round=1 entschluesselt c1/c2 rueckwaerts exakt durch k5, k4, k3
-            # rueckgabe von _peel_cipher ist der zustand u2 (vor s-box in runde 2)
             u2_1 = self._peel_cipher(c1, known_keys, 1)
             u2_2 = self._peel_cipher(c2, known_keys, 1)
 
-            # 2. anwendung deines beweis: delta u2 = u2_1 ^ u2_2
-            delta_u2 = u2_1 ^ u2_2
+            # Linear key elimination: ΔU_2 = (W_{1,1} ^ K_2) ^ (W_{1,2} ^ K_2) = ΔW_1
+            delta_w1 = u2_1 ^ u2_2
+            delta_v1 = spn.inverse_p_box(
+                Bits(f"{delta_w1:016b}"), spn.heys_p_matrix
+            ).to_int()
 
-            # gemaess theorie: delta u2 eliminiert k2 und entspricht exakt delta w1
-            delta_w1 = delta_u2
-
-            # 3. delta v1 berechnen (inverse p-box von delta w1)
-            delta_v1 = self.spn.inverse_p_box(Bits(f"{delta_w1:016b}"), self.spn.heys_p_matrix).to_int() if hasattr(
-                self, 'spn') else spn.inverse_p_box(Bits(f"{delta_w1:016b}"), spn.heys_p_matrix).to_int()
-
-            # 4. k1 lokal pro s-box (nibble) ueber bruteforce isolieren
             for i in range(4):
                 shift = 12 - i * 4
                 p1_nibble = (p1 >> shift) & 0xF
                 p2_nibble = (p2 >> shift) & 0xF
                 dv1_nibble = (delta_v1 >> shift) & 0xF
 
-                valid_guesses = set()
-                for k_guess in range(16):
-                    # pruefe s-box bedingung: S(P1 ^ K) ^ S(P2 ^ K) == delta V1
-                    v1_1 = self.sbox_list[p1_nibble ^ k_guess]
-                    v1_2 = self.sbox_list[p2_nibble ^ k_guess]
-
-                    if (v1_1 ^ v1_2) == dv1_nibble:
-                        valid_guesses.add(k_guess)
-
-                # bilde schnittmenge der validen keys mit den vorherigen paaren
+                valid_guesses = {
+                    k_guess
+                    for k_guess in range(16)
+                    if (
+                        self.sbox_list[p1_nibble ^ k_guess]
+                        ^ self.sbox_list[p2_nibble ^ k_guess]
+                    )
+                    == dv1_nibble
+                }
                 k1_candidates[i] &= valid_guesses
 
-        # 5. k1 aus den eindeutigen nibbles zusammensetzen
         k1 = 0
         for i in range(4):
             if not k1_candidates[i]:
-                raise ValueError(f"inkonsistenz in phase 2: kein valider k1-kandidat an s-box {i + 1} gefunden.")
+                raise ValueError(
+                    f"Phase 2 inconsistency: no valid K1 nibble candidate at S-box {i + 1}."
+                )
+            k1_nibble = next(iter(k1_candidates[i]))
+            k1 |= k1_nibble << (12 - i * 4)
 
-            # durch die schnittmenge bleibt exakt ein korrekter kandidat uebrig
-            k1_nibble = list(k1_candidates[i])[0]
-            k1 |= (k1_nibble << (12 - i * 4))
-
-        # 6. k2 berechnen ueber umformung: u2 = w1 ^ k2 => k2 = u2 ^ w1
+        # Recover K2 deterministically from a single pair: K_2 = U_2 ^ W_1
         p1, _, c1, _ = pairs[0]
         u2_1 = self._peel_cipher(c1, known_keys, 1)
 
-        # w1 durch vorwaertsrechnung (P1 -> K1 -> S-Box -> P-Box) ermitteln
         u1_1 = p1 ^ k1
         v1_1 = 0
         for i in range(4):
             nibble = (u1_1 >> (12 - i * 4)) & 0xF
-            v1_1 |= (self.sbox_list[nibble] << (12 - i * 4))
+            v1_1 |= self.sbox_list[nibble] << (12 - i * 4)
 
-        w1_1 = self.spn.p_box(Bits(f"{v1_1:016b}"), self.spn.heys_p_matrix).to_int() if hasattr(self, 'spn') else spn.p_box(Bits(f"{v1_1:016b}"), spn.heys_p_matrix).to_int()
-
+        w1_1 = spn.p_box(Bits(f"{v1_1:016b}"), spn.heys_p_matrix).to_int()
         k2 = u2_1 ^ w1_1
 
         return k1, k2
 
-    def execute_complete_break(self, oracle_encrypt: callable, descriptive: bool = False) -> list[int]:
+    def execute_complete_break(
+        self, oracle_encrypt: OracleFn, descriptive: bool = False
+    ) -> list[int]:
+        """Executes the complete two-phase differential attack recovering `[K1, K2, K3, K4, K5]`.
+
+        Args:
+            oracle_encrypt: Black-box encryption function `oracle.encrypt`.
+            descriptive: If True, prints per-round trail statistics and top candidate hits.
+
+        Returns:
+            List of five 16-bit integers `[K1, K2, K3, K4, K5]`.
         """
-        executes the complete key recovery attack on the spn cipher.
-        """
-        # initialisiere subkey liste (laenge 5: k1 bis k5 liegen sicher auf indizes 0 bis 4)
         extracted_keys = [0] * (self.num_rounds + 1)
 
-        # phase 1: iterative target partial subkey extraktion fuer k5, k4, k3
-        # target_round durchlaeuft 3, 2, 1 (0-indexed offset fuer runden 4, 3, 2)
+        # Phase 1: Iterative statistical partial subkey extraction for K5, K4, K3
         for target_round in range(self.num_rounds - 1, 0, -1):
-            k_idx = target_round + 1  # 4, 3, 2 -> greift exakt auf k5, k4, k3 im array zu
+            k_idx = target_round + 1
 
             if descriptive:
-                print(f"--- 1. darstellung der angewandten trails (k{k_idx + 1}) ---")
-                print("--- 2. hit-counting pro trail ---")
+                print(f"--- 1. Applied Differential Trails (K{k_idx + 1}) ---")
+                print("--- 2. Hit-Counting per Trail ---")
 
-            # berechne highly probable differential trails
             trails = self.get_highly_probable_trails(round_num=target_round)
             active_trails = self.find_trail_combinations(trails)
 
-            partial_candidates = []
-            for i, trail in enumerate(active_trails):
-                # isoliere target partial subkey bits mittels bitmask
+            partial_candidates: list[tuple[int, list[int]]] = []
+            for idx, trail in enumerate(active_trails):
                 mask = self.get_active_key_mask(trail[3], target_round)
-
-                # fuehre partial decryption und hit-counting aus
-                # target_round (3, 2, 1) wird sauber an extraktion und _peel_cipher uebergeben
                 candidates_with_hits = self.extract_partial_subkey(
                     oracle=oracle_encrypt,
                     trail=trail,
                     mask=mask,
                     target_round=target_round,
-                    known_keys=extracted_keys
+                    known_keys=extracted_keys,
                 )
 
-                # isoliere pure subkey kandidaten fuer consistency check
                 pure_candidates = [k for k, _ in candidates_with_hits]
                 partial_candidates.append((mask, pure_candidates))
 
                 if descriptive:
-                    top_3 = [f"0x{k:04X} ({hits} hits)" for k, hits in candidates_with_hits[:3]]
-                    print(f"trail {i + 1} -> top 3: {top_3}")
+                    top_3 = [
+                        f"0x{k:04X} ({hits} hits)"
+                        for k, hits in candidates_with_hits[:3]
+                    ]
+                    print(f"Trail {idx + 1} -> Top 3: {top_3}")
 
-            # merge independent partial subkeys via intersection logik
             full_candidates = self.merge_key_candidates(partial_candidates)
             extracted_keys[k_idx] = full_candidates[0]
 
             if descriptive:
-                print(f"\n--- 3. finales resultat (K{k_idx + 1}) ---")
-                print(f"nach merge logik: subkey prediction{k_idx + 1}: 0x{extracted_keys[k_idx]:04X}\n")
+                print(f"\n--- 3. Merged Subkey Result (K{k_idx + 1}) ---")
+                print(
+                    f"Merged Subkey Prediction K{k_idx + 1}: 0x{extracted_keys[k_idx]:04X}\n"
+                )
 
-        # phase 2: algebraische eliminierung von k2 und k1
+        # Phase 2: Algebraic recovery of K2 and K1
         if descriptive:
-            print("--- SWITCH IN PHASE 2, d.h. (K2 & K1) ---")
+            print("--- Phase 2: Algebraic Elimination (K2 & K1) ---")
 
         extracted_keys[0], extracted_keys[1] = self.recover_remaining_layers(
             oracle=oracle_encrypt,
-            known_keys=extracted_keys
+            known_keys=extracted_keys,
         )
 
         if descriptive:
-            print(f"subkey prediction k2: 0x{extracted_keys[1]:04X}")
-            print(f"subkey prediction k1: 0x{extracted_keys[0]:04X}\n")
+            print(f"Subkey Prediction K2: 0x{extracted_keys[1]:04X}")
+            print(f"Subkey Prediction K1: 0x{extracted_keys[0]:04X}\n")
 
-        # rueckgabe der extrahierten subkeys [k1, k2, k3, k4, k5]
         return extracted_keys

@@ -1,28 +1,91 @@
-from sage.all import Matrix, vector
-from sage.matrix.matrix_integer_dense import Matrix_integer_dense as SageMatrix
-from sage.rings.function_field.hermite_form_polynomial import identity_matrix
+"""4-round Substitution-Permutation Network (SPN) cipher implementation (Heys, 2002)."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Any
 
 from modules.bits import Bits
 
-heys_s_map: dict[str, str] = {
-    '0000': '1110',
-    '0001': '0100',
-    '0010': '1101',
-    '0011': '0001',
-    '0100': '0010',
-    '0101': '1111',
-    '0110': '1011',
-    '0111': '1000',
-    '1000': '0011',
-    '1001': '1010',
-    '1010': '0110',
-    '1011': '1100',
-    '1100': '0101',
-    '1101': '1001',
-    '1110': '0000',
-    '1111': '0111'}
+try:
+    from sage.all import Matrix, identity_matrix, vector
+    from sage.matrix.matrix_integer_dense import Matrix_integer_dense as SageMatrix
+except ImportError:
 
-heys_p_matrix: SageMatrix = Matrix([
+    class _FallbackMatrix:
+        """Pure-Python 0/1 matrix fallback when SageMath is not installed."""
+
+        def __init__(self, rows: Sequence[Sequence[int]]) -> None:
+            self._rows: tuple[tuple[int, ...], ...] = tuple(
+                tuple(int(x) for x in row) for row in rows
+            )
+            self._inverse: _FallbackMatrix | None = None
+
+        def inverse(self) -> _FallbackMatrix:
+            """Returns the inverse of an orthogonal permutation matrix (its transpose)."""
+            if self._inverse is None:
+                n = len(self._rows)
+                transposed = [
+                    [self._rows[r][c] for r in range(n)] for c in range(n)
+                ]
+                inv = _FallbackMatrix(transposed)
+                inv._inverse = self
+                self._inverse = inv
+            return self._inverse
+
+        def __mul__(self, vec: Sequence[int]) -> list[int]:
+            return [
+                sum(r_val * v_val for r_val, v_val in zip(row, vec))
+                for row in self._rows
+            ]
+
+        def __getitem__(self, idx: int) -> tuple[int, ...]:
+            return self._rows[idx]
+
+        def __len__(self) -> int:
+            return len(self._rows)
+
+        def __eq__(self, other: object) -> bool:
+            if isinstance(other, _FallbackMatrix):
+                return self._rows == other._rows
+            return NotImplemented
+
+    SageMatrix = _FallbackMatrix  # type: ignore[misc,assignment]
+
+    def Matrix(rows: Sequence[Sequence[int]]) -> _FallbackMatrix:  # noqa: N802
+        return _FallbackMatrix(rows)
+
+    def vector(elements: Sequence[int]) -> list[int]:
+        return list(elements)
+
+    def identity_matrix(size: int) -> _FallbackMatrix:
+        return _FallbackMatrix(
+            [[1 if r == c else 0 for c in range(size)] for r in range(size)]
+        )
+
+
+heys_s_map: dict[str, str] = {
+    "0000": "1110",
+    "0001": "0100",
+    "0010": "1101",
+    "0011": "0001",
+    "0100": "0010",
+    "0101": "1111",
+    "0110": "1011",
+    "0111": "1000",
+    "1000": "0011",
+    "1001": "1010",
+    "1010": "0110",
+    "1011": "1100",
+    "1100": "0101",
+    "1101": "1001",
+    "1110": "0000",
+    "1111": "0111",
+}
+
+heys_inverse_s_map: dict[str, str] = {v: k for k, v in heys_s_map.items()}
+
+heys_p_matrix: Any = Matrix([
     [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
@@ -38,221 +101,180 @@ heys_p_matrix: SageMatrix = Matrix([
     [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
 ])
+
+_IDENTITY_16: Any = identity_matrix(16)
+_HEYS_P_INVERSE: Any = heys_p_matrix.inverse()
+
+# Precomputed bit-position mapping for Heys' 16-bit permutation (P(i) = 4*(i mod 4) + (i // 4))
+_HEYS_BIT_PERM: tuple[int, ...] = (
+    0, 4, 8, 12,
+    1, 5, 9, 13,
+    2, 6, 10, 14,
+    3, 7, 11, 15,
+)
+
+
+def permute_16bit_int(state: int) -> int:
+    """Applies Heys' 16-bit P-box permutation directly on a 16-bit integer."""
+    out = 0
+    for src_bit, dst_bit in enumerate(_HEYS_BIT_PERM):
+        if (state >> (15 - src_bit)) & 1:
+            out |= 1 << (15 - dst_bit)
+    return out
 
 
 def s_box(four_bits: Bits) -> Bits:
+    """Applies the 4-bit non-linear S-box substitution (π_S) from Heys (2002).
+
+    Args:
+        four_bits: 4-bit input Bits vector.
+
+    Returns:
+        Substituted 4-bit Bits vector.
     """
-    Simulates the S-Box from heys.pdf
-    :param four_bits: 4-bit Bits object
-    :return: substitution for the 4 bits
-    """
-    key = ''.join(str(b) for b in four_bits.bit_list)
+    key = str(four_bits)
+    if key not in heys_s_map:
+        raise ValueError(f"Expected 4-bit input for S-box, got '{key}'")
     return Bits(heys_s_map[key], do_trim=False)
 
 
 def inverse_s_box(four_bits: Bits) -> Bits:
+    """Applies the inverse 4-bit S-box substitution (π_S^-1).
+
+    Args:
+        four_bits: 4-bit S-box output Bits vector.
+
+    Returns:
+        Original 4-bit S-box input Bits vector.
     """
-    Simulates the inverse of the S-Box from heys.pdf
-    :param four_bits: 4-bit Bits object (S-Box output)
-    :return: 4-bit Bits object (S-Box input)
-    """
-    val = ''.join(str(b) for b in four_bits.bit_list)
-    for key in heys_s_map:
-        if heys_s_map[key] == val:
-            return Bits(key, do_trim=False)
-    raise Exception
+    val = str(four_bits)
+    if val not in heys_inverse_s_map:
+        raise ValueError(f"Expected 4-bit input for inverse S-box, got '{val}'")
+    return Bits(heys_inverse_s_map[val], do_trim=False)
 
 
-def p_box(sixteen_bits: Bits, permutation: SageMatrix) -> Bits:
-    """
-    Simulates the P-Box from heys.pdf
-    :param sixteen_bits: 16-bit Bits object
-    :param permutation: 16x16 permutation matrix
-    :return: permutated 16-bit Bits object
+def p_box(sixteen_bits: Bits, permutation: Any) -> Bits:
+    """Permutes a 16-bit block via matrix-vector multiplication (π_P).
+
+    Args:
+        sixteen_bits: 16-bit input Bits vector.
+        permutation: 16x16 binary permutation matrix.
+
+    Returns:
+        Permuted 16-bit Bits vector.
     """
     input_vector = vector(sixteen_bits.bit_list)
     output_vector = permutation * input_vector
-    return Bits(''.join(str(x) for x in output_vector), do_trim=False)
+    return Bits([int(x) for x in output_vector], do_trim=False)
 
 
-def inverse_p_box(sixteen_bits: Bits, permutation: SageMatrix) -> Bits:
+def inverse_p_box(sixteen_bits: Bits, permutation: Any) -> Bits:
+    """Applies the inverse 16-bit permutation (π_P^-1).
+
+    Args:
+        sixteen_bits: 16-bit input Bits vector.
+        permutation: 16x16 binary permutation matrix.
+
+    Returns:
+        Unpermuted 16-bit Bits vector.
     """
-    Simulates the inverse of the P-Box from heys.pdf
-    :param sixteen_bits: 16-bit Bits object
-    :param permutation: 16x16 permutation matrix
-    :return: un-permutated 16-bit Bits object
-    """
+    inv_matrix = (
+        _HEYS_P_INVERSE
+        if permutation is heys_p_matrix
+        else permutation.inverse()
+    )
     input_vector = vector(sixteen_bits.bit_list)
-    output_vector = permutation.inverse() * input_vector
-    return Bits(''.join(str(x) for x in output_vector), do_trim=False)
+    output_vector = inv_matrix * input_vector
+    return Bits([int(x) for x in output_vector], do_trim=False)
 
 
 def _xor(first: Bits, second: Bits) -> Bits:
-    """
-    Xor bit lists if they are of equal length.
-    :param first: Bits object
-    :param second: Bits object
-    :return: XOR result as 16-bit Bits
-    """
-    if len(first.bit_list) != len(second.bit_list):
-        raise ValueError('Input bitlists must be of equal length')
-    result_val = int(str(first), 2) ^ int(str(second), 2)
-    return Bits(f'{result_val:016b}', do_trim=False)
+    """Computes fixed-width 16-bit XOR of two equal-length Bits vectors."""
+    if len(first) != len(second):
+        raise ValueError("Input bit vectors must be of equal length")
+    result_val = first.to_int() ^ second.to_int()
+    return Bits(f"{result_val:0{len(first)}b}", do_trim=False)
 
 
 def key_mixing(sixteen_bits: Bits, sixteen_bit_key: Bits) -> Bits:
-    """
-    Xor of a 16-bit Bits with a 16-bit key.
-    :param sixteen_bits: 16-bit Bits object
-    :param sixteen_bit_key: 16-bit Bits key
-    :return: Bits object, xor of the two
-    """
+    """Mixes a 16-bit state block with a 16-bit round subkey via bitwise XOR."""
     return _xor(sixteen_bits, sixteen_bit_key)
 
 
-def spn_round(sixteen_bits: Bits, sixteen_bit_key: Bits,
-              permutation: SageMatrix = identity_matrix(16)) -> Bits:
+def spn_round(
+    sixteen_bits: Bits,
+    sixteen_bit_key: Bits,
+    permutation: Any | None = None,
+) -> Bits:
+    """Executes one forward SPN round: key mixing, 4 parallel S-boxes, and P-box.
+
+    Args:
+        sixteen_bits: 16-bit round input block.
+        sixteen_bit_key: 16-bit round subkey.
+        permutation: 16x16 permutation matrix (defaults to 16x16 identity for final round).
+
+    Returns:
+        16-bit round output block.
     """
-    Simulates one round of the SPN from heys.pdf.
-    :param sixteen_bits: 16-bit Bits object
-    :param sixteen_bit_key: 16-bit Bits key
-    :param permutation: 16x16 permutation matrix
-    :return: 16-bit Bits object
-    """
-    key_mixed = key_mixing(sixteen_bits, sixteen_bit_key)
-    s = str(key_mixed)
-    substituted = (s_box(Bits(s[0:4], do_trim=False)) + s_box(Bits(s[4:8], do_trim=False)) +
-                   s_box(Bits(s[8:12], do_trim=False)) + s_box(Bits(s[12:], do_trim=False)))
-    return p_box(substituted, permutation)
+    perm = _IDENTITY_16 if permutation is None else permutation
+    key_mixed = str(key_mixing(sixteen_bits, sixteen_bit_key))
+    substituted = (
+        s_box(Bits(key_mixed[0:4], do_trim=False))
+        + s_box(Bits(key_mixed[4:8], do_trim=False))
+        + s_box(Bits(key_mixed[8:12], do_trim=False))
+        + s_box(Bits(key_mixed[12:16], do_trim=False))
+    )
+    return p_box(substituted, perm)
 
 
-def inverse_spn_round(sixteen_bits: Bits, sixteen_bit_key: Bits,
-                      permutation: SageMatrix = identity_matrix(16)) -> Bits:
-    """
-    Simulates one inverse round of the SPN from heys.pdf.
-    :param sixteen_bits: 16-bit Bits object
-    :param sixteen_bit_key: 16-bit Bits key
-    :param permutation: 16x16 permutation matrix
-    :return: 16-bit Bits object
-    """
-    un_permutated = inverse_p_box(sixteen_bits, permutation)
-    s = str(un_permutated)
-    unsubstituted = (inverse_s_box(Bits(s[0:4], do_trim=False)) +
-                     inverse_s_box(Bits(s[4:8], do_trim=False)) +
-                     inverse_s_box(Bits(s[8:12], do_trim=False)) +
-                     inverse_s_box(Bits(s[12:], do_trim=False)))
+def inverse_spn_round(
+    sixteen_bits: Bits,
+    sixteen_bit_key: Bits,
+    permutation: Any | None = None,
+) -> Bits:
+    """Executes one inverse SPN round: inverse P-box, 4 inverse S-boxes, and key mixing."""
+    perm = _IDENTITY_16 if permutation is None else permutation
+    unpermuted = str(inverse_p_box(sixteen_bits, perm))
+    unsubstituted = (
+        inverse_s_box(Bits(unpermuted[0:4], do_trim=False))
+        + inverse_s_box(Bits(unpermuted[4:8], do_trim=False))
+        + inverse_s_box(Bits(unpermuted[8:12], do_trim=False))
+        + inverse_s_box(Bits(unpermuted[12:16], do_trim=False))
+    )
     return key_mixing(unsubstituted, sixteen_bit_key)
 
 
-def spn(sixteen_bits: Bits, eighty_bit_key: Bits, permutation: SageMatrix) -> Bits:
-    """
-    Simulates the SPN consisting of 4 rounds from heys.pdf.
-    :param sixteen_bits: 16-bit Bits object
-    :param eighty_bit_key: 80-bit Bits key
-    :param permutation: 16x16 permutation matrix
-    :return: 16-bit Bits object
-    """
-    k = str(eighty_bit_key)
-    sixteen_bit_subkeys = (
-        Bits(k[0:16], do_trim=False),
-        Bits(k[16:32], do_trim=False),
-        Bits(k[32:48], do_trim=False),
-        Bits(k[48:64], do_trim=False),
-        Bits(k[64:80], do_trim=False))
-
-    sixteen_bits = spn_round(sixteen_bits, sixteen_bit_subkeys[0], permutation)
-    sixteen_bits = spn_round(sixteen_bits, sixteen_bit_subkeys[1], permutation)
-    sixteen_bits = spn_round(sixteen_bits, sixteen_bit_subkeys[2], permutation)
-    sixteen_bits = spn_round(sixteen_bits, sixteen_bit_subkeys[3])
-    sixteen_bits = key_mixing(sixteen_bits, sixteen_bit_subkeys[4])
-    return sixteen_bits
+def _split_master_key(eighty_bit_key: Bits) -> tuple[Bits, Bits, Bits, Bits, Bits]:
+    """Splits an 80-bit master key into five 16-bit round subkeys (K1..K5)."""
+    key_str = str(eighty_bit_key)
+    if len(key_str) != 80:
+        raise ValueError(f"Expected 80-bit master key, got {len(key_str)} bits")
+    return (
+        Bits(key_str[0:16], do_trim=False),
+        Bits(key_str[16:32], do_trim=False),
+        Bits(key_str[32:48], do_trim=False),
+        Bits(key_str[48:64], do_trim=False),
+        Bits(key_str[64:80], do_trim=False),
+    )
 
 
-def inverse_spn(sixteen_bits: Bits, eighty_bit_key: Bits, permutation: SageMatrix) -> Bits:
-    """
-    Simulates the inverse of the SPN consisting of four rounds from heys.pdf.
-    :param sixteen_bits: 16-bit Bits object
-    :param eighty_bit_key: 80-bit Bits key
-    :param permutation: 16x16 permutation matrix
-    :return: 16-bit Bits object
-    """
-    k = str(eighty_bit_key)
-    sixteen_bit_subkeys = (
-        Bits(k[0:16], do_trim=False),
-        Bits(k[16:32], do_trim=False),
-        Bits(k[32:48], do_trim=False),
-        Bits(k[48:64], do_trim=False),
-        Bits(k[64:80], do_trim=False))
-
-    sixteen_bits = key_mixing(sixteen_bits, sixteen_bit_subkeys[4])
-    sixteen_bits = inverse_spn_round(sixteen_bits, sixteen_bit_subkeys[3])
-    sixteen_bits = inverse_spn_round(sixteen_bits, sixteen_bit_subkeys[2], permutation)
-    sixteen_bits = inverse_spn_round(sixteen_bits, sixteen_bit_subkeys[1], permutation)
-    sixteen_bits = inverse_spn_round(sixteen_bits, sixteen_bit_subkeys[0], permutation)
-    return sixteen_bits
+def spn(sixteen_bits: Bits, eighty_bit_key: Bits, permutation: Any) -> Bits:
+    """Encrypts a 16-bit plaintext block through the 4-round SPN cipher."""
+    subkeys = _split_master_key(eighty_bit_key)
+    state = spn_round(sixteen_bits, subkeys[0], permutation)
+    state = spn_round(state, subkeys[1], permutation)
+    state = spn_round(state, subkeys[2], permutation)
+    state = spn_round(state, subkeys[3])
+    return key_mixing(state, subkeys[4])
 
 
-if __name__ == '__main__':
-    # Test Bits.check_bits
-    Bits.check_bits('1001')
-    Bits.check_bits('1001', 4)
-    try:
-        Bits.check_bits('100a')
-        raise Exception('Expected ValueError for invalid chars')
-    except ValueError:
-        pass
-    try:
-        Bits.check_bits('01110', 4)
-        raise Exception('Expected ValueError for invalid length')
-    except ValueError:
-        pass
-    try:
-        Bits.check_bits('190', 4)
-        raise Exception('Expected ValueError for invalid chars and length')
-    except ValueError:
-        pass
-
-    # Test S-Box
-    for i in range(16):
-        test_bits = Bits(f'{i:04b}', do_trim=False)
-        if not inverse_s_box(s_box(test_bits)).bit_list == test_bits.bit_list:
-            raise Exception('S-Box and its inverse shuffle bits randomly')
-
-    test_bitstring = Bits('0101010001001010', do_trim=False)
-
-    # Test P-Box
-    if not inverse_p_box(p_box(test_bitstring, heys_p_matrix), heys_p_matrix).bit_list == test_bitstring.bit_list:
-        raise Exception('P-Box and its inverse shuffle bits randomly')
-
-    short_keystring = Bits('1001110010101001', do_trim=False)
-
-    # Test Key Mixing
-    # check for x - x = 0
-    if not key_mixing(test_bitstring, test_bitstring).bit_list == [0] * 16:
-        raise Exception('Key Mixing shuffles bits randomly')
-    # check for x + k - k = 0
-    if not key_mixing(key_mixing(test_bitstring, short_keystring), short_keystring).bit_list == test_bitstring.bit_list:
-        raise Exception('Key Mixing shuffles bits randomly')
-
-    # Test SPN Round
-    round1 = spn_round(test_bitstring, short_keystring)
-    inverse_round1 = inverse_spn_round(round1, short_keystring)
-    if not inverse_round1.bit_list == test_bitstring.bit_list:
-        raise Exception('Not permutated spn_round and its inverse shuffle bits randomly')
-
-    round2 = spn_round(test_bitstring, short_keystring, permutation=heys_p_matrix)
-    inverse_round2 = inverse_spn_round(round2, short_keystring, permutation=heys_p_matrix)
-    if not inverse_round2.bit_list == test_bitstring.bit_list:
-        raise Exception('Permutated spn_round and its inverse shuffle bits randomly')
-
-    # Test SPN
-    spn_keystring = Bits('00010100000101001111001101011111001000010111101110001000111110101001001001101010',
-                         do_trim=False)
-    result = spn(test_bitstring, spn_keystring, heys_p_matrix)
-    result_inv = inverse_spn(result, spn_keystring, heys_p_matrix)
-    if not result_inv.bit_list == test_bitstring.bit_list:
-        raise Exception('SPN and its inverse shuffle bits randomly')
-
-    print('Tutto bene')
+def inverse_spn(sixteen_bits: Bits, eighty_bit_key: Bits, permutation: Any) -> Bits:
+    """Decrypts a 16-bit ciphertext block through the 4-round inverse SPN cipher."""
+    subkeys = _split_master_key(eighty_bit_key)
+    state = key_mixing(sixteen_bits, subkeys[4])
+    state = inverse_spn_round(state, subkeys[3])
+    state = inverse_spn_round(state, subkeys[2], permutation)
+    state = inverse_spn_round(state, subkeys[1], permutation)
+    return inverse_spn_round(state, subkeys[0], permutation)

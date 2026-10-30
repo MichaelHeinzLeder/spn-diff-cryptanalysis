@@ -1,379 +1,214 @@
+"""Bit-vector abstraction supporting bitwise arithmetic, nibble extraction, and serialization."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+
 class Bits:
-    """
-    A class representing a list of bits.
+    """Represents a fixed or variable-width binary vector as a sequence of {0, 1} bits.
 
     Attributes:
-        bit_list: list of integer (bits)
+        bit_list: Underlying list of integer bits (0 or 1), ordered MSB to LSB.
     """
+
+    bit_list: list[int]
 
     @staticmethod
     def check_bits(bitstring: str, expected_length: int = 0) -> None:
-        """
-        Check for valid bitstring of length n if n > 0.
+        """Validates that a string contains only '0'/'1' characters and matches expected_length.
 
-        Parameters:
-            bitstring: string of n bits
-            expected_length: expected bitstring length
+        Args:
+            bitstring: Binary string to validate.
+            expected_length: Required bit length when strictly positive (0 disables length check).
 
         Raises:
-            ValueError: If bitstring has invalid characters or wrong length.
+            ValueError: If bitstring contains non-binary characters or has an unexpected length.
         """
         if 0 < expected_length != len(bitstring):
-            raise ValueError(f'Input bitstring must be of expected length {expected_length}')
-        if not all(c in '01' for c in bitstring):
-            raise ValueError("Input must be a string containing only '0' and '1'")
+            raise ValueError(f"Input bitstring must be of expected length {expected_length}")
+        if not bitstring or any(c not in "01" for c in bitstring):
+            raise ValueError("Input must be a non-empty string containing only '0' and '1'")
 
-    def __init__(self, bits_value: str | list[int], do_trim: bool=False) -> None:
+    def __init__(self, bits_value: str | Sequence[int], do_trim: bool = False) -> None:
+        """Initializes a Bits instance from a binary string or a sequence of {0, 1} integers.
+
+        Args:
+            bits_value: Binary string (e.g. '0101') or sequence of 0/1 integers.
+            do_trim: If True, strips leading zero bits (preserving a single '0' if all zero).
+
+        Raises:
+            TypeError: If bits_value is neither a str nor a sequence of integers.
+            ValueError: If any element is outside {0, 1}.
         """
-        Initialize a Bits object.
-
-        Parameters:
-            bits_value: String of bits or list of bits.
-            do_trim: Remove leading zeros.
-        """
-        self.bit_list = []
-
         if isinstance(bits_value, str):
-            Bits.check_bits(bits_value)
+            self.check_bits(bits_value)
+            self.bit_list = [int(bit) for bit in bits_value]
+        elif isinstance(bits_value, list | tuple):
+            validated: list[int] = []
             for bit in bits_value:
-                self.bit_list.append(int(bit))
-
-        elif isinstance(bits_value, list):
-            for b in bits_value:
-                if b not in (0, 1):
-                    raise ValueError(f'All list elements must be 0 or 1, got {b!r}')
-            self.bit_list = bits_value
-
+                if bit not in (0, 1) or isinstance(bit, bool):
+                    raise ValueError(f"All sequence elements must be 0 or 1, got {bit!r}")
+                validated.append(int(bit))
+            if not validated:
+                raise ValueError("Bits sequence must not be empty")
+            self.bit_list = validated
         else:
-            raise TypeError('Bits must be created from a string or a list')
+            raise TypeError("Bits must be created from a binary string or a list of 0/1 ints")
 
         if do_trim:
-            self.trim()
+            self.bit_list = self.trim().bit_list
 
     def __str__(self) -> str:
-        """
-        Returns the bits stored in this Bits object as a string.
-        
-        Returns:
-            String of bits.
-        """
-        return ''.join(str(bit) for bit in self.bit_list)
-    
+        """Returns the binary string representation (MSB first)."""
+        return "".join(str(bit) for bit in self.bit_list)
+
+    def __repr__(self) -> str:
+        """Returns an unambiguous developer representation."""
+        return f"Bits('{self}')"
+
     def __len__(self) -> int:
-        """
-        Returns the amount of bits in this object.
-        
-        Returns:
-            bit_list length.
-        """
+        """Returns the bit width of this vector."""
         return len(self.bit_list)
 
-    def trim(self) -> 'Bits':
-        """
-        Removes leading zeroes.
-
-        Returns:
-            Trimmed Bits object.
-        """
-        for i, x in enumerate(self.bit_list):
-            if x == 1:
-                return Bits(self.bit_list[i:])
+    def trim(self) -> Bits:
+        """Returns a new Bits instance with leading zero bits removed."""
+        for idx, bit in enumerate(self.bit_list):
+            if bit == 1:
+                return Bits(self.bit_list[idx:])
         return Bits([0])
 
     def get_bits_as_byte_array(self, do_trim: bool = False) -> list[str]:
-        """
-        Returns the bits stored in this Bits object as list of strings grouped as bytes.
-        ['01011010', ...]
+        """Groups the bit vector into 8-bit binary strings, zero-padded on the left.
 
-        Parameters:
-            do_trim: Remove leading zeros.
+        Args:
+            do_trim: Strip leading zeros prior to byte alignment.
 
         Returns:
-            List of byte strings in bit representation.
+            List of 8-character binary strings.
         """
-        if do_trim:
-            self.trim()
+        source_bits = self.trim().bit_list if do_trim else self.bit_list
+        missing_bits = (-len(source_bits)) % 8
+        padded = [0] * missing_bits + source_bits
+        return [
+            "".join(str(bit) for bit in padded[i : i + 8])
+            for i in range(0, len(padded), 8)
+        ]
 
-        # calculate missing bits to a multiple of 8
-        missing_bits = (-len(self.bit_list)) % 8
-
-        # insert 0s at the front to get to a list size multiple of 8
-        temp_bits = [0 for _ in range(missing_bits)] + self.bit_list
-
-        byte_array = []
-
-        # fill list with bytes
-        for i in range(0, len(temp_bits), 8):
-            byte_array.append(''.join(str(bit) for bit in temp_bits[i:i+8]))
-
-        return byte_array
-
-    def __add__(self, other: 'Bits') -> 'Bits':
-        """
-        Append Bits object.
-
-        Parameters:
-            other: Bits object to append.
-
-        Returns:
-            Bits object
-
-        Examples:
-        >>> result = Bits('101') + Bits('010')
-        >>> print(result)
-        101010
-        """
-        return Bits(self.bit_list + other.bit_list)
-
-    def __xor__(self, other: 'Bits', do_trim: bool = False) -> 'Bits':
-        """
-        Performs a bitwise XOR operation with another Bits object and returns a new Bits object.
-
-        Parameters:
-            other: Bits object
-            do_trim: Remove leading zeros.
-
-        Returns:
-            Bits object
-
-        Examples:
-        >>> result = Bits('10101') ^ Bits('01100')
-        >>> print(result)
-        11001
-        """
-        l1 = other.bit_list[:]
-        l2 = self.bit_list[:]
-
-        # bring both bit lists to same size
-        max_len = max(len(l1), len(l2))
-        l1 = [0] * (max_len - len(l1)) + l1
-        l2 = [0] * (max_len - len(l2)) + l2
-
-        result = Bits([int(bit1) ^ int(bit2) for bit1, bit2 in zip(l1, l2)])
-
-        if do_trim:
-            result = result.trim()
-
-        return result
-
-    def __or__(self, other: 'Bits', do_trim: bool) -> 'Bits':
-        """
-        Performs a bitwise OR operation with another Bit object and returns a new Bits object.
-
-        Parameters:
-            other: Bits object
-            do_trim: Remove leading zeros.
-
-        Returns:
-            Bits object
-
-        Examples:
-        >>> result = Bits('1011', do_trim=True) | Bits('0010', False)
-        >>> print(result)
-        1011
-        """
-        l1 = other.bit_list[:]
-        l2 = self.bit_list[:]
-
-        # bring both bit lists to same size
-        max_len = max(len(l1), len(l2))
-        l1 = [0] * (max_len - len(l1)) + l1
-        l2 = [0] * (max_len - len(l2)) + l2
-
-        result = Bits([bit1 | bit2 for bit1, bit2 in zip(l1, l2)])
-
-        if do_trim:
-            result = result.trim()
-
-        return result
-
-    def __lshift__(self, positions: int, fill_bit: int = 0) -> 'Bits':
-        """
-        Logical left shift operation.
-
-        Parameters:
-            positions: amount of positions to shift
-            fill_bit: bit used to fill on the right
-
-        Returns:
-            Bits object
-
-        Examples:
-        >>> result = Bits('101') << 3
-        >>> print(result)
-        101000
-        """
-        if positions < 0:
-            raise ValueError('positions must be non-negative')
-
-        if fill_bit not in (0, 1):
-            raise ValueError('Expected fill_bit needs to be an integer bit (0 or 1)')
-
-        bits = self.bit_list[:]
-        bits.extend([fill_bit] * positions)
-        return Bits(bits)
-
-    def __rshift__(self, amount: int) -> 'Bits':
-        """
-        Logical right shift operation.
-
-        Parameters:
-            amount: The amount of bits to remove from the right.
-
-        Returns:
-            Bits object
-
-        Examples:
-        >>> result = Bits('101111') >> 3
-        >>> print(result)
-        101
-        """
-        if amount < 0:
-            raise ValueError('amount must be non-negative')
-
-        amount = min(amount, len(self.bit_list))
-
-        new_len = len(self.bit_list) - amount
-
-        return Bits(self.bit_list[:new_len])
-    
-    def __eq__(self, other: 'Bits') -> bool:
-        """
-        Checks if the two Bits objects represent the same Bit value ignoring leading zeroes.
-
-        Parameters:
-            other: The Bits object to compare with.
-
-        Returns:
-            Boolean if equal (True) or not (False).
-        """
+    def __add__(self, other: Bits) -> Bits:
+        """Concatenates two Bits vectors."""
         if not isinstance(other, Bits):
             return NotImplemented
+        return Bits(self.bit_list + other.bit_list)
 
-        thisCopy = self.trim()
-        otherCopy = other.trim()
+    @staticmethod
+    def _align_vectors(left: list[int], right: list[int]) -> tuple[list[int], list[int]]:
+        """Left-pads the shorter bit list with zeros so both lists have equal length."""
+        max_len = max(len(left), len(right))
+        return (
+            [0] * (max_len - len(left)) + left,
+            [0] * (max_len - len(right)) + right,
+        )
 
-        return thisCopy.bit_list == otherCopy.bit_list
+    def __xor__(self, other: Bits, do_trim: bool = False) -> Bits:
+        """Computes the bitwise XOR with another Bits vector."""
+        if not isinstance(other, Bits):
+            return NotImplemented
+        l1, l2 = self._align_vectors(self.bit_list, other.bit_list)
+        result = Bits([b1 ^ b2 for b1, b2 in zip(l1, l2)])
+        return result.trim() if do_trim else result
+
+    def __or__(self, other: Bits, do_trim: bool = False) -> Bits:
+        """Computes the bitwise OR with another Bits vector."""
+        if not isinstance(other, Bits):
+            return NotImplemented
+        l1, l2 = self._align_vectors(self.bit_list, other.bit_list)
+        result = Bits([b1 | b2 for b1, b2 in zip(l1, l2)])
+        return result.trim() if do_trim else result
+
+    def __and__(self, other: Bits, do_trim: bool = False) -> Bits:
+        """Computes the bitwise AND with another Bits vector."""
+        if not isinstance(other, Bits):
+            return NotImplemented
+        l1, l2 = self._align_vectors(self.bit_list, other.bit_list)
+        result = Bits([b1 & b2 for b1, b2 in zip(l1, l2)])
+        return result.trim() if do_trim else result
+
+    def __lshift__(self, positions: int, fill_bit: int = 0) -> Bits:
+        """Appends `positions` fill bits to the LSB end (logical left shift)."""
+        if positions < 0:
+            raise ValueError("positions must be non-negative")
+        if fill_bit not in (0, 1):
+            raise ValueError("fill_bit must be 0 or 1")
+        return Bits(self.bit_list + [fill_bit] * positions)
+
+    def __rshift__(self, amount: int) -> Bits:
+        """Truncates `amount` bits from the LSB end (logical right shift)."""
+        if amount < 0:
+            raise ValueError("amount must be non-negative")
+        if amount >= len(self.bit_list):
+            return Bits([0])
+        return Bits(self.bit_list[: len(self.bit_list) - amount])
+
+    def __eq__(self, other: object) -> bool:
+        """Compares two Bits instances by numerical value (ignoring leading zeros)."""
+        if not isinstance(other, Bits):
+            return NotImplemented
+        return self.trim().bit_list == other.trim().bit_list
 
     def to_int(self) -> int:
-        """
-        Converts the bits stored in this Bits object to an integer.
-
-        Returns:
-        Integer representation of the bits.
-
-        Examples:
-        >>> result = Bits('1010').to_int()
-        >>> print(result)
-        10
-        """
-        return int(str(self), 2)
+        """Converts the bit vector into a non-negative Python integer."""
+        value = 0
+        for bit in self.bit_list:
+            value = (value << 1) | bit
+        return value
 
     def get_nibble(self, idx: int) -> int:
-        """
-        Extracts a specific 4-bit block (nibble) from the bit string.
+        """Extracts a 4-bit nibble by index (0 = least significant / rightmost nibble)."""
+        return (self.to_int() >> (idx << 2)) & 0xF
 
-        Parameters:
-        idx: The index of the nibble (0-indexed, where 0 is the least significant / rightmost nibble).
+    def set_nibble(self, idx: int, nibble_val: int) -> Bits:
+        """Replaces a 4-bit nibble by index (0 = rightmost) while preserving bit width."""
+        if not 0 <= nibble_val <= 0xF:
+            raise ValueError(f"nibble_val must be in [0, 15], got {nibble_val}")
+        bit_width = len(self.bit_list)
+        shift = idx << 2
+        masked = self.to_int() & ~(0xF << shift)
+        updated = masked | (nibble_val << shift)
+        return Bits(f"{updated:0{bit_width}b}")
 
-        Returns:
-        Integer value (0-15) of the extracted nibble.
-        """
-        val = self.to_int()
-        return (val >> (idx << 2)) & 0xf
-
-    def set_nibble(self, idx: int, nibble_val: int) -> 'Bits':
-        """
-        Overwrites a specific 4-bit block (nibble) and returns a new Bits object
-        maintaining the original bit length.
-
-        Parameters:
-        idx: The index of the nibble to replace (0-indexed, from the right).
-        nibble_val: The new integer value (0-15) to insert.
-
-        Returns:
-        Bits object
-        """
-        val = self.to_int()
-        bit_mask = ~(0xf << (idx << 2))
-        new_val = (val & bit_mask) | (nibble_val << (idx << 2))
-
-        return Bits(f"{new_val:0{len(self.bit_list)}b}")
-    
     def to_hexstring(self) -> str:
-        """
-        Convert the bits in this object to a hex string
-
-        Returns:
-            hex bit string
-        """
-        hex_length = (len(str(self)) + 3) // 4
-
-        return format(int(str(self), 2), "x").zfill(hex_length)
+        """Formats the bit vector as a zero-padded lowercase hexadecimal string."""
+        hex_length = (len(self.bit_list) + 3) // 4
+        return f"{self.to_int():0{hex_length}x}"
 
     @staticmethod
-    def from_hexstring(hexstring: str) -> 'Bits':
-        """
-        Convert a hex string to an Bits object
-
-        Parameters:
-            hexstring: string of hex values
-
-        Raises:
-            ValueError: If hexstring has invalid characters.
-
-        Returns:
-            Bits object
-        """
+    def from_hexstring(hexstring: str) -> Bits:
+        """Parses a hexadecimal string into a Bits vector preserving leading zero nibbles."""
+        if not hexstring:
+            raise ValueError("Hexstring must not be empty")
         try:
-            bitstring = bin(int(hexstring, 16))[2:]
+            value = int(hexstring, 16)
+        except ValueError as exc:
+            raise ValueError(
+                "Input must be a valid hexadecimal string ([0-9a-fA-F])"
+            ) from exc
+        bit_width = len(hexstring) * 4
+        return Bits(f"{value:0{bit_width}b}")
 
-            leading_zeroes = len(hexstring) * 4 - len(bitstring)
-            
-            bitstring = bitstring.zfill(leading_zeroes + len(bitstring))
-
-            return Bits(bitstring)
-        except ValueError:
-            raise ValueError("Input must be a string containing only '0', ..., '9', 'a', ..., 'f'")
-    
     @staticmethod
-    def from_text(text: str) -> 'Bits':
-        """
-        Convert a text corresponding to ascii
-
-        Parameters:
-            text: text, which will be converted
-
-        Returns:
-            Bits object
-        """
+    def from_text(text: str) -> Bits:
+        """Encodes an ASCII string into a Bits vector (8 bits per character)."""
         ascii_bytes = text.encode("ascii")
-        
-        return Bits("".join(format(byte, "08b") for byte in ascii_bytes))
+        return Bits.from_py_bytes(ascii_bytes)
 
     def to_py_bytes(self) -> bytes:
-        """
-        Convert bits to a b'\x00\x01' style bytes object
+        """Serializes the bit vector into a big-endian bytes object."""
+        return bytes(int(byte_str, 2) for byte_str in self.get_bits_as_byte_array())
 
-        Returns:
-            bytes object
-        """
-        result = bytearray()
-
-        for byte_string in self.get_bits_as_byte_array():
-            result.append(int(byte_string, 2))
-
-        return bytes(result)
-    
     @staticmethod
-    def from_py_bytes(bytes: bytes) -> 'Bits':
-        """
-        Convert a bytes object (b'\x00\x01') to a Bits object
-
-        Parameters:
-            bytes: bytes object, which will be converted
-
-        Returns:
-            Bits object
-        """
-        return Bits("".join(f"{byte:08b}" for byte in bytes))
+    def from_py_bytes(raw_bytes: bytes) -> Bits:
+        """Deserializes a bytes object into a Bits vector."""
+        if not raw_bytes:
+            raise ValueError("raw_bytes must not be empty")
+        return Bits("".join(f"{byte:08b}" for byte in raw_bytes))
